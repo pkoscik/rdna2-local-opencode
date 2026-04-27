@@ -9,6 +9,17 @@ A local LLM inference setup using llama.cpp (TurboQuant fork) with ROCm on AMD h
 - **RAM:** 64 GB system
 - **OS:** Arch-based
 
+## Requirements
+
+On Arch installing packages:
+```
+llvm
+hip-runtime-amd
+hipblas
+rocblas
+```
+and adding `/opt/rocm/bin` to PATH is required for `./build.sh` to succeed.
+
 ## Quick Start
 
 ```bash
