@@ -88,7 +88,7 @@ sudo pacman -S opencode
 ./init_opencode.sh
 ```
 
-The model ID (`qwen36`) is just a label - `llama-server` serves whatever GGUF is loaded. No config change is needed when switching modes; just stop the server, switch mode, restart, and start a fresh session in OpenCode.
+The model ID (`qwen38`) is just a label - `llama-server` serves whatever GGUF is loaded. No config change is needed when switching modes; just stop the server, switch mode, restart, and start a fresh session in OpenCode.
 
 ## Models
 

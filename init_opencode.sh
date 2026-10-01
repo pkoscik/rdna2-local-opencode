@@ -24,13 +24,13 @@ cat > "$CONFIG_FILE" <<'EOF'
         "baseURL": "http://127.0.0.1:8080/v1"
       },
       "models": {
-        "qwen36": {
-          "name": "Qwen3.6 (local)"
+        "qwen38": {
+          "name": "Qwen3.8 (local)"
         }
       }
     }
   },
-  "model": "llamacpp/qwen36-27b",
-  "small_model": "llamacpp/qwen36-27b"
+  "model": "llamacpp/qwen38",
+  "small_model": "llamacpp/qwen38"
 }
 EOF
