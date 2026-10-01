@@ -1,179 +1,118 @@
 #!/usr/bin/env bash
-set -e
+# Start llama-server with config/<name>.conf (default: moe). Env vars override the config:
+#   CTX=65536 NO_TUI=1 ./run.sh dense
+set -euo pipefail
+cd "$(dirname "$0")"
+shopt -s nullglob
 
-# -----------------------------------------------------------------------------
-# Presets (set MODE=… or just run with the default)
-# -----------------------------------------------------------------------------
-#   fast    -> 35B-A3B MoE,  no thinking, 32k ctx       [agent loops, daily driver]
-#   smart   -> 27B dense,    short thinking, 32k ctx    [hard one-shot questions]
-#   bigctx  -> 27B dense,    no thinking, 100k ctx      [reading huge files / many files]
-#   custom  -> set MODEL yourself, ignore presets
-# -----------------------------------------------------------------------------
-MODE="${MODE:-fast}"
+BIN=./llama-cpp-turboquant/build/bin/llama-server
+M27=models/Qwen3.8-27B-UD-IQ4_XS.gguf
+M35=models/Qwen3.8-35B-A3B-Q6_K.gguf
+declare -A URL=(
+  [$M27]=https://huggingface.co/unsloth/Qwen3.8-27B-GGUF/resolve/main/Qwen3.8-27B-UD-IQ4_XS.gguf
+  [$M35]=https://huggingface.co/empero-ai/Qwen3.8-35B-A3B-Distill-GGUF/resolve/main/Qwen3.8-35B-A3B-Q6_K.gguf
+)
+KNOBS=(MODEL CTX THINKING THINK_BUDGET N_CPU_MOE B UB CTK CTV CACHE_RAM TEMP TOP_P PRESENCE PORT EXTRA)
 
-# -----------------------------------------------------------------------------
-# Knobs - leave empty to use the preset's value, or set via env to override.
-#   e.g.  MODE=fast CTX=65536 THINKING=on ./run.sh
-# -----------------------------------------------------------------------------
-MODEL="${MODEL:-}"                    # path to .gguf
-CTX="${CTX:-}"                        # context size in tokens
-THINKING="${THINKING:-}"              # on | off
-THINK_BUDGET="${THINK_BUDGET:-2048}"  # max thinking tokens when THINKING=on
-N_CPU_MOE="${N_CPU_MOE:-}"            # 0 for dense, ~28 for 35B-A3B on 16GB VRAM
-B="${B:-}"                            # batch size (prompt eval throughput)
-UB="${UB:-}"                          # micro-batch size (compute buffer = ~UB scaled)
-PORT="${PORT:-8080}"
+die() { echo "✗ $*" >&2; exit 1; }
 
-# -----------------------------------------------------------------------------
-# Paths
-# -----------------------------------------------------------------------------
-BIN="./llama-cpp-turboquant/build/bin/llama-server"
-MODELS_DIR="./models"
-MODEL_27B="$MODELS_DIR/Qwen3.6-27B-UD-Q3_K_XL.gguf"
-MODEL_35B="$MODELS_DIR/Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf"
-URL_27B="https://huggingface.co/unsloth/Qwen3.6-27B-GGUF/resolve/main/Qwen3.6-27B-UD-Q3_K_XL.gguf"
-URL_35B="https://huggingface.co/unsloth/Qwen3.6-35B-A3B-GGUF/resolve/main/Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf"
+# Knobs already set in the environment win over every config.
+declare -A ENV=()
+for k in "${KNOBS[@]}"; do [[ -n ${!k:-} ]] && ENV[$k]=${!k}; done
 
-mkdir -p "$MODELS_DIR"
+defaults() {
+  MODEL=$M35 CTX=131072 THINKING=on THINK_BUDGET=4096 N_CPU_MOE=28 B=2048 UB=2048
+  CTK=f16 CTV=f16 CACHE_RAM=16384 TEMP=auto TOP_P=auto PRESENCE=auto PORT=8080
+  EXTRA="--spec-type draft-mtp --spec-draft-n-max 3"
+}
+load() {
+  NAME=$1 CONF=config/$1.conf
+  defaults
+  [[ -f $CONF ]] && source "$CONF"
+  for k in "${!ENV[@]}"; do printf -v "$k" %s "${ENV[$k]}"; done
+}
+dump() { for k in "${KNOBS[@]}"; do printf '%s=%q\n' "$k" "${!k}"; done; }
 
-download_if_missing() {
-  local path="$1" url="$2"
-  if [[ -f "$path" ]]; then
-    echo "✓ $path already present"
-  else
-    echo "↓ downloading $(basename "$path") ..."
-    wget --continue --show-progress -O "$path" "$url"
-  fi
+wt() { whiptail --title "llama-server [$NAME]" "$@" 3>&1 1>&2 2>&3; }
+
+tui() {
+  local choice=LAUNCH val f items opts
+  while :; do
+    items=(LAUNCH "start server" LOAD "switch to another config/*.conf" SAVE_AS "copy the knobs to a new config")
+    for k in "${KNOBS[@]}"; do items+=("$k" "${!k}"); done
+    choice=$(wt --default-item "$choice" --cancel-button Quit \
+      --menu "Enter edits a knob, changes are saved to $CONF (auto = model-recommended)" 0 0 0 -- "${items[@]}") || exit 1
+    case $choice in
+      LAUNCH) return ;;
+      LOAD)
+        opts=()
+        for f in config/*.conf; do f=${f#config/}; opts+=("${f%.conf}" ""); done
+        (( ${#opts[@]} )) || continue
+        val=$(wt --default-item "$NAME" --menu "Config" 0 0 0 -- "${opts[@]}") && load "$val"
+        continue ;;
+      SAVE_AS) val=$(wt --inputbox "New config name" 0 60 -- "$NAME") && [[ -n $val ]] && NAME=$val CONF=config/$val.conf ;;
+      THINKING) [[ $THINKING == on ]] && THINKING=off || THINKING=on ;;
+      MODEL)
+        opts=()
+        for f in $(printf '%s\n' "$M35" "$M27" models/*.gguf | awk '!s[$0]++'); do
+          opts+=("$f" "$([[ -f $f ]] && echo "✓ local" || echo "↓ will download")")
+        done
+        val=$(wt --default-item "$MODEL" --menu "Model" 0 0 0 -- "${opts[@]}") && MODEL=$val ;;
+      *) val=$(wt --inputbox "$choice" 0 60 -- "${!choice}") && printf -v "$choice" %s "$val" ;;
+    esac
+    mkdir -p config && dump > "$CONF"
+  done
 }
 
-# -----------------------------------------------------------------------------
-# Apply preset (each preset fills in any knob the user didn't set)
-# -----------------------------------------------------------------------------
-case "$MODE" in
-  fast)
-    download_if_missing "$MODEL_35B" "$URL_35B"
-    : "${MODEL:=$MODEL_35B}"
-    : "${CTX:=32768}"
-    : "${THINKING:=off}"
-    : "${N_CPU_MOE:=28}"
-    : "${B:=4096}"
-    : "${UB:=2048}"
-    ALIAS="qwen36-35b-a3b"
-    ;;
-  smart)
-    download_if_missing "$MODEL_27B" "$URL_27B"
-    : "${MODEL:=$MODEL_27B}"
-    : "${CTX:=32768}"
-    : "${THINKING:=on}"
-    : "${N_CPU_MOE:=0}"
-    : "${B:=4096}"
-    : "${UB:=2048}"
-    ALIAS="qwen36-27b"
-    ;;
-  bigctx)
-    download_if_missing "$MODEL_27B" "$URL_27B"
-    : "${MODEL:=$MODEL_27B}"
-    : "${CTX:=102400}"
-    : "${THINKING:=off}"
-    : "${N_CPU_MOE:=0}"
-    : "${B:=2048}"
-    : "${UB:=512}"
-    ALIAS="qwen36-27b-bigctx"
-    ;;
-  custom)
-    if [[ -z "$MODEL" ]]; then
-      echo "✗ MODE=custom but no MODEL set. Example:"
-      echo "    MODE=custom MODEL=./models/foo.gguf CTX=16384 ./run.sh"
-      exit 1
-    fi
-    : "${CTX:=32768}"
-    : "${THINKING:=off}"
-    : "${N_CPU_MOE:=0}"
-    : "${B:=2048}"
-    : "${UB:=512}"
-    ALIAS="custom"
-    ;;
-  *)
-    echo "✗ Unknown MODE: $MODE  (use: fast | smart | bigctx | custom)"
-    exit 1
-    ;;
-esac
-
-# -----------------------------------------------------------------------------
-# Preflight checks
-# -----------------------------------------------------------------------------
-if [[ ! -x "$BIN" ]]; then
-  echo "✗ llama-server binary not found at $BIN"
-  echo "  Did you build the fork? See setup notes."
-  exit 1
+load "${1:-${CONFIG:-moe}}"
+[[ $# -gt 0 && ! -f $CONF ]] && die "no such config: $CONF (configs: $(ls config 2>/dev/null | sed 's/\.conf//' | xargs))"
+if [[ -t 0 && -t 1 && -z ${NO_TUI:-} ]] && command -v whiptail >/dev/null; then
+  tui
 fi
 
-if ss -tln 2>/dev/null | grep -q ":$PORT "; then
-  echo "✗ port $PORT already in use"
-  echo "  Run: lsof -i :$PORT  (or set PORT=8081)"
-  exit 1
-fi
-
-# -----------------------------------------------------------------------------
-# Sampling params (Unsloth recommendations for Qwen3.6)
-# -----------------------------------------------------------------------------
-if [[ "$THINKING" == "on" ]]; then
-  TEMP=0.6; TOP_P=0.95; PRESENCE=0.0
-  REASONING_FLAGS=( --reasoning on --reasoning-budget "$THINK_BUDGET" )
+# Sampling: Qwen3.8-27B card says temp 1.0 when thinking, the 35B one says 0.6.
+if [[ $THINKING == on ]]; then
+  [[ $TEMP == auto ]] && TEMP=$([[ $MODEL == *35B* ]] && echo 0.6 || echo 1.0)
+  [[ $TOP_P == auto ]] && TOP_P=0.95
+  [[ $PRESENCE == auto ]] && PRESENCE=0.0
+  REASONING=(--reasoning on --reasoning-budget "$THINK_BUDGET")
 else
-  TEMP=0.7; TOP_P=0.8;  PRESENCE=1.5
-  REASONING_FLAGS=( --reasoning off )
+  [[ $TEMP == auto ]] && TEMP=0.7
+  [[ $TOP_P == auto ]] && TOP_P=0.8
+  [[ $PRESENCE == auto ]] && PRESENCE=1.5
+  REASONING=(--reasoning off)
+fi
+MOE=(); [[ $N_CPU_MOE -gt 0 ]] && MOE=(--n-cpu-moe "$N_CPU_MOE")
+read -ra EXTRA_ARGS <<< "$EXTRA"
+
+[[ -x $BIN ]] || die "llama-server not found at $BIN - run ./build.sh first"
+! ss -tln 2>/dev/null | grep -q ":$PORT " || die "port $PORT in use (lsof -i :$PORT, or PORT=8081)"
+
+if [[ ! -f $MODEL ]]; then
+  [[ -v URL[$MODEL] ]] || die "model not found: $MODEL"
+  echo "↓ downloading $(basename "$MODEL") ..."
+  # .part so an interrupted download is resumed, never mistaken for a complete file
+  wget --continue --show-progress -O "$MODEL.part" "${URL[$MODEL]}"
+  mv "$MODEL.part" "$MODEL"
 fi
 
-# Only pass --n-cpu-moe when there's something to offload
-MOE_FLAGS=()
-if [[ "$N_CPU_MOE" -gt 0 ]]; then
-  MOE_FLAGS=( --n-cpu-moe "$N_CPU_MOE" )
-fi
+echo; echo "  config: $CONF"; dump | sed 's/^/  /'; echo
 
-# Hide Ryzen iGPU from ROCm
-export HIP_VISIBLE_DEVICES=0
-export ROCR_VISIBLE_DEVICES=0
+# Hide the Ryzen iGPU from ROCm, pin the dGPU to its high-performance state
+export HIP_VISIBLE_DEVICES=0 ROCR_VISIBLE_DEVICES=0
+for f in /sys/class/drm/card*/device/power_dpm_force_performance_level; do
+  d=${f%/*}
+  [[ $(<"$f") == high ]] || echo high | sudo tee "$f" >/dev/null || true
+  [[ $(<"$d/power/control") == on ]] || echo on | sudo tee "$d/power/control" >/dev/null || true
+done
 
-# Put GPUs in high perf state
-echo high | sudo tee /sys/class/drm/card*/device/power_dpm_force_performance_level
-echo on | sudo tee /sys/class/drm/card*/device/power/control
-
-# -----------------------------------------------------------------------------
-# Summary
-# -----------------------------------------------------------------------------
-cat <<EOF
-
-----------------------------------------------
-  MODE       : $MODE
-  Model      : $MODEL
-  Context    : $CTX
-  Batch/UB   : $B / $UB
-  Thinking   : $THINKING $( [[ $THINKING == on ]] && echo "(budget=$THINK_BUDGET)" )
-  CPU-MoE    : $N_CPU_MOE $( [[ $N_CPU_MOE -gt 0 ]] && echo "(experts on RAM)" )
-  Port       : $PORT
-----------------------------------------------
-
-EOF
-
-# -----------------------------------------------------------------------------
-# Launch
-# -----------------------------------------------------------------------------
 exec "$BIN" \
-  -m "$MODEL" \
-  --alias "$ALIAS" \
+  -m "$MODEL" --alias "$(basename "$MODEL" .gguf)" \
   --host 127.0.0.1 --port "$PORT" \
-  -c "$CTX" \
-  -b "$B" -ub "$UB" \
-  -ngl 99 \
-  -fa 1 \
-  --cache-type-k turbo3 --cache-type-v turbo3 \
-  --cache-ram 0 \
-  --no-context-shift \
-  --ctx-checkpoints 4 \
-  --jinja \
-  "${REASONING_FLAGS[@]}" \
-  "${MOE_FLAGS[@]}" \
+  -c "$CTX" -b "$B" -ub "$UB" -ngl 99 -fa 1 \
+  --cache-type-k "$CTK" --cache-type-v "$CTV" \
+  --cache-ram "$CACHE_RAM" --no-context-shift \
+  --jinja "${REASONING[@]}" "${MOE[@]}" \
   --temp "$TEMP" --top-p "$TOP_P" --top-k 20 --min-p 0.0 \
   --presence-penalty "$PRESENCE" \
-  -np 1
+  -np 1 "${EXTRA_ARGS[@]}"

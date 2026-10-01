@@ -15,31 +15,28 @@ A local LLM inference setup using llama.cpp (TurboQuant fork) with ROCm on AMD h
 # 1. Build llama.cpp TurboQuant fork
 ./build.sh
 
-# 2. Download models and start server (default: fast / 35B-A3B)
+# 2. Pick a config in the TUI, tweak knobs, launch (downloads the model on first use)
 ./run.sh
 
 # 3. Point OpenCode to http://127.0.0.1:8080/v1
 ```
 
-## Presets
+## Configs
 
-`run.sh` has four built-in presets. Set `MODE` to select one:
+`./run.sh [name]` loads `config/<name>.conf` (default `moe`). In a terminal it opens a small whiptail TUI: Enter edits a knob, `LOAD` switches to another config, `SAVE_AS` copies the knobs to a new config, and `LAUNCH` starts the server. Edits are written back to the loaded config file. With `NO_TUI=1` or no TTY it launches directly. Env vars override the config for one run.
 
-| Preset | Model | Context | Thinking | CPU-MoE | Batch / UB | Best for |
-|--------|-------|---------|----------|---------|------------|----------|
-| `fast` | 35B-A3B MoE | 32k | off | 28 | 4096 / 2048 | Daily agent work |
-| `smart` | 27B dense | 32k | on (2048 budget) | 0 | 4096 / 2048 | Hard one-shot questions |
-| `bigctx` | 27B dense | 100k | off | 0 | 2048 / 512 | Reading large codebases |
-| `custom` | (you set) | (you set) | (you set) | (you set) | 2048 / 512 | Experimenting |
+| Config | Model | Context | KV | CPU-MoE | Spec | Best for |
+|--------|-------|---------|----|---------|------|----------|
+| `moe` | 35B-A3B Q6_K | 131k | f16 | 28 | MTP | programming agent + chat |
+| `moe-long` | 35B-A3B Q6_K | 262k | f16 | 32 | MTP | whole-repo context |
+| `dense` | 27B IQ4_XS | 32k | q8_0 | - | MTP | hard chat questions with thinking |
 
 ```bash
-./run.sh                           # default: fast
-MODE=smart ./run.sh                # 27B with thinking
-MODE=bigctx ./run.sh               # 27B with 100k context
-MODE=fast CTX=65536 ./run.sh       # override context
-MODE=fast THINKING=on ./run.sh     # force thinking on
-MODE=fast N_CPU_MOE=32 ./run.sh    # tweak expert offload
-MODE=bigctx UB=256 ./run.sh        # tighter compute buffer if OOM
+./run.sh                           # TUI on config/moe.conf
+./run.sh dense                     # TUI on config/dense.conf
+NO_TUI=1 ./run.sh moe-long         # launch directly
+CTX=65536 NO_TUI=1 ./run.sh        # one-off override, not saved
+THINKING=off ./run.sh              # faster agent loops
 ```
 
 ## Setup
@@ -92,14 +89,12 @@ The model ID (`qwen38`) is just a label - `llama-server` serves whatever GGUF is
 
 ## Models
 
-Two GGUFs are downloaded automatically by `run.sh`:
+`run.sh` downloads the selected GGUF on first use:
 
-| Model | File | Size | Best for |
-|-------|------|------|----------|
-| Qwen3.6-27B Q3_K_XL | `Qwen3.6-27B-UD-Q3_K_XL.gguf` | 13.5 GB | Hard one-shot questions, reasoning |
-| Qwen3.6-35B-A3B Q4_K_XL | `Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf` | 22 GB | Agent loops, daily driver |
-
-The 27B is smarter but slower; the 35B-A3B is a MoE model that activates only 3B params per token - faster, with remaining experts offloaded to system RAM.
+| Model | File | Size | Source | Best for |
+|-------|------|------|--------|----------|
+| Qwen3.8-35B-A3B Q6_K | `Qwen3.8-35B-A3B-Q6_K.gguf` | 29.2 GB | [empero-ai/Qwen3.8-35B-A3B-Distill-GGUF](https://huggingface.co/empero-ai/Qwen3.8-35B-A3B-Distill-GGUF) | Daily driver (`moe`, `moe-long`) |
+| Qwen3.8-27B UD-IQ4_XS | `Qwen3.8-27B-UD-IQ4_XS.gguf` | 14.3 GB | [unsloth/Qwen3.8-27B-GGUF](https://huggingface.co/unsloth/Qwen3.8-27B-GGUF) | Hard chat questions (`dense`) |
 
 ## Tuning Knobs
 
@@ -109,19 +104,8 @@ The 27B is smarter but slower; the 35B-A3B is a MoE model that activates only 3B
 | `B` / `UB` | Batch / micro-batch for prompt eval | Faster ingest, more VRAM | Slower ingest, fits bigger contexts |
 | `THINKING` | Internal reasoning before answering | Better one-shot quality, much slower | Faster, fine for agent loops |
 | `THINK_BUDGET` | Max thinking tokens per turn | More deliberation | Avoids token spirals |
-| `N_CPU_MOE` | MoE experts offloaded to RAM | Less VRAM, slightly slower | More VRAM, slightly faster |
-| `--cache-type-k/v` | KV cache precision | turbo3 = 3-bit (fits more context) | f16/bf16 = full precision (safer) |
-| `-ngl` | Layers on GPU (99 = all) | More on GPU = faster | More on CPU = more RAM |
-| `-np` | Parallel conversation slots | Multiple clients | Single client gets full KV |
-
-### Quantization
-
-We use Unsloth's Dynamic 2.0 (UD-prefix) non-uniform quantization:
-
-| Quant | Size | Quality vs BF16 | Note |
-|-------|------|-----------------|---------|
-| UD-Q2_K_XL | ~10 GB | ~92% | Only if really squeezed |
-| UD-Q3_K_XL | ~13.5 GB | ~99% | Sweet spot for 27B |
-| UD-Q4_K_XL | ~16.5 GB | ~99.5% | 35B-A3B default |
-| UD-Q6_K | ~22 GB | ~99.9% | Too big without offload |
-
+| `TEMP` / `TOP_P` / `PRESENCE` | Sampling (`auto` = model card values for the thinking mode) | More varied | More deterministic |
+| `N_CPU_MOE` | MoE expert layers kept in RAM | Less VRAM, slower | Faster, OOM below the fit limit |
+| `CTK` / `CTV` | KV cache precision (`f16`, `q8_0`, `turbo2/3/4`) | - | Quantized = less VRAM, slower decode at depth on RDNA2 |
+| `CACHE_RAM` | Host-RAM prompt cache in MiB (0 = off) | More conversations survive side requests | - |
+| `EXTRA` | Extra `llama-server` args, e.g. speculative decoding | - | - |
